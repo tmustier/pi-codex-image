@@ -1,5 +1,5 @@
 {
-  "name": "pi-codex-image",
+  "name": "@tmustier/pi-codex-image",
   "version": "0.1.0",
   "description": "Pi extension that exposes Codex CLI image generation as a codex_image tool.",
   "license": "MIT",
