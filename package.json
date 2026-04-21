@@ -1,0 +1,38 @@
+{
+  "name": "pi-codex-image",
+  "version": "0.1.0",
+  "description": "Pi extension that exposes Codex CLI image generation as a codex_image tool.",
+  "license": "MIT",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "image-generation"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tmustier/pi-codex-image.git"
+  },
+  "homepage": "https://github.com/tmustier/pi-codex-image#readme",
+  "bugs": {
+    "url": "https://github.com/tmustier/pi-codex-image/issues"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  }
+}
