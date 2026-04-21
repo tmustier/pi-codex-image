@@ -27,7 +27,7 @@ This extension does **not** call an image API directly. It is a thin bridge from
 ### From npm
 
 ```bash
-pi install npm:@tmustier/pi-codex-image
+pi install npm:pi-codex-image
 ```
 
 ### From git
@@ -39,7 +39,7 @@ pi install git:github.com/tmustier/pi-codex-image
 ### For a one-off test
 
 ```bash
-pi -e npm:@tmustier/pi-codex-image
+pi -e npm:pi-codex-image
 # or
 pi -e git:github.com/tmustier/pi-codex-image
 ```
