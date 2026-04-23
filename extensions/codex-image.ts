@@ -1,16 +1,18 @@
-import { homedir, tmpdir } from "node:os";
-import { join, resolve, dirname, extname } from "node:path";
 import { spawn } from "node:child_process";
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { dirname, extname, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { truncateTail, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 
 const TOOL_NAME = "codex_image";
+const TOOL_LABEL = "pi-codex-image";
 const AUTH_PATH = join(homedir(), ".codex", "auth.json");
 const GENERATED_IMAGES_DIR = "generated_images";
 const DEFAULT_TIMEOUT_SEC = 180;
 const MAX_TIMEOUT_SEC = 900;
+const PREFLIGHT_TIMEOUT_MS = 5_000;
 
 const TOOL_PARAMS = Type.Object({
   prompt: Type.String({
@@ -47,6 +49,19 @@ const TOOL_PARAMS = Type.Object({
 });
 
 type ToolParams = Static<typeof TOOL_PARAMS>;
+
+type CommandCaptureResult = {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+};
+
+type CodexHealth = {
+  ok: boolean;
+  summary: string;
+  details: string[];
+};
 
 function stripAtPrefix(value: string): string {
   return value.startsWith("@") ? value.slice(1) : value;
@@ -103,12 +118,120 @@ function imageMimeType(path: string): string {
   }
 }
 
+function tail(text: string, maxLines = 40, maxBytes = 12_000): string {
+  return truncateTail(text, { maxLines, maxBytes }).content.trim();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function toTrimmedString(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    const text = toTrimmedString(value);
+    if (text) return text;
+  }
+  return undefined;
+}
+
+function normalizeStringArray(value: unknown): string[] | undefined {
+  if (typeof value === "string") {
+    return value.trim() ? [value.trim()] : undefined;
+  }
+  if (!Array.isArray(value)) return undefined;
+  const normalized = value
+    .map((item) => toTrimmedString(item))
+    .filter((item): item is string => Boolean(item));
+  return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["true", "1", "yes", "y", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "n", "off"].includes(normalized)) return false;
+  return undefined;
+}
+
+function normalizeInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isInteger(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const parsed = Number.parseInt(value.trim(), 10);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function prepareToolArguments(args: unknown): ToolParams {
+  if (typeof args === "string") {
+    return { prompt: args };
+  }
+
+  if (!isRecord(args)) {
+    throw new Error(`${TOOL_NAME} expects an object with at least a prompt string.`);
+  }
+
+  const prompt = firstString(args.prompt, args.request, args.instructions, args.description, args.text);
+  if (!prompt) {
+    throw new Error(
+      `${TOOL_NAME} requires a prompt. Accepted aliases: prompt, request, instructions, description, text.`,
+    );
+  }
+
+  const inputImages = normalizeStringArray(
+    args.inputImages ??
+      args.input_images ??
+      args.images ??
+      args.image ??
+      args.references ??
+      args.referenceImages ??
+      args.reference_images ??
+      args.reference,
+  );
+
+  const outputPath = firstString(
+    args.outputPath,
+    args.output_path,
+    args.path,
+    args.output,
+    args.file,
+    args.filename,
+  );
+
+  const overwrite = normalizeBoolean(args.overwrite ?? args.force ?? args.replace);
+  const model = firstString(args.model, args.codexModel, args.codex_model);
+  const timeoutSec = normalizeInteger(args.timeoutSec ?? args.timeout_sec ?? args.timeoutSeconds ?? args.timeout);
+
+  return {
+    prompt,
+    ...(inputImages ? { inputImages } : {}),
+    ...(outputPath ? { outputPath } : {}),
+    ...(typeof overwrite === "boolean" ? { overwrite } : {}),
+    ...(model ? { model } : {}),
+    ...(typeof timeoutSec === "number" ? { timeoutSec } : {}),
+  };
+}
+
+function userAskedForMultipleImages(prompt: string): boolean {
+  return /\b(variants?|multiple|several|set of|options|different versions|three versions|four versions)\b/i.test(prompt);
+}
+
 function buildCodexPrompt(params: ToolParams): string {
   const sections = [
     "Use Codex's built-in image_generation tool for this request.",
-    "Generate the requested raster image output and then answer briefly with what you made.",
+    "Generate raster image output and then answer briefly with what you made.",
     "Do not edit or create files in the workspace.",
   ];
+
+  if (params.outputPath || !userAskedForMultipleImages(params.prompt)) {
+    sections.push("Generate exactly one final image unless the user explicitly asked for multiple variants.");
+  }
 
   if ((params.inputImages?.length ?? 0) > 0) {
     sections.push(
@@ -116,29 +239,61 @@ function buildCodexPrompt(params: ToolParams): string {
     );
   }
 
+  if (params.outputPath) {
+    sections.push("Because the caller requested outputPath, the result must be a single final image.");
+  }
+
   sections.push(`User request:\n${params.prompt}`);
   return sections.join("\n\n");
 }
 
-function tail(text: string, maxLines = 40, maxBytes = 12_000): string {
-  return truncateTail(text, { maxLines, maxBytes }).content.trim();
+function formatCodexFailure(result: CommandCaptureResult, finalMessage: string, timeoutSec: number): string {
+  const stderrTail = tail(result.stderr);
+  const stdoutTail = tail(result.stdout);
+  const combined = `${stderrTail}\n${stdoutTail}\n${finalMessage}`.toLowerCase();
+  const hints: string[] = [];
+
+  if (result.timedOut) {
+    hints.push(`Hint: Codex timed out after ${timeoutSec}s. Try a simpler prompt or increase timeoutSec.`);
+  }
+  if (combined.includes("no prompt provided via stdin")) {
+    hints.push("Hint: the Codex CLI expected stdin prompt input. The extension now uses stdin; reload pi if you still see this.");
+  }
+  if (combined.includes("login") || combined.includes("auth")) {
+    hints.push("Hint: ensure Codex is logged in locally (`codex login`) and that ~/.codex/auth.json exists.");
+  }
+  if (combined.includes("image_generation")) {
+    hints.push("Hint: this Codex build may not support the image_generation feature flag expected by the extension.");
+  }
+
+  return [
+    `Codex exited with code ${result.code ?? "unknown"}.`,
+    stderrTail ? `stderr:\n${stderrTail}` : "",
+    stdoutTail ? `stdout:\n${stdoutTail}` : "",
+    finalMessage.trim() ? `last message:\n${finalMessage.trim()}` : "",
+    ...hints,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
-async function runCodex(
+async function runCommandCapture(
+  command: string,
   args: string[],
   options: {
-    cwd: string;
-    env: NodeJS.ProcessEnv;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
     timeoutMs: number;
-    onStatus?: (text: string) => void;
+    stdinText?: string;
     signal?: AbortSignal;
+    onStatus?: (text: string) => void;
   },
-): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+): Promise<CommandCaptureResult> {
   return new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn("codex", args, {
+    const child = spawn(command, args, {
       cwd: options.cwd,
       env: options.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     let stdout = "";
@@ -172,13 +327,11 @@ async function runCodex(
 
     timeoutTimer = setTimeout(() => {
       timedOut = true;
-      options.onStatus?.("Codex timed out; stopping process...");
       requestTerminate();
     }, options.timeoutMs);
 
     if (options.signal) {
       if (options.signal.aborted) {
-        timedOut = false;
         requestTerminate();
       } else {
         options.signal.addEventListener("abort", abortHandler, { once: true });
@@ -188,6 +341,13 @@ async function runCodex(
     child.on("error", (error) => {
       settle(() => rejectPromise(error));
     });
+
+    if (typeof options.stdinText === "string") {
+      child.stdin.write(options.stdinText);
+      child.stdin.end();
+    } else {
+      child.stdin.end();
+    }
 
     child.stdout.on("data", (chunk: Buffer | string) => {
       stdout += chunk.toString();
@@ -212,20 +372,114 @@ async function runCodex(
   });
 }
 
-export default function codexImage(pi: ExtensionAPI) {
+async function detectCodexHealth(): Promise<CodexHealth> {
+  const details: string[] = [];
+
+  try {
+    await access(AUTH_PATH);
+    details.push(`auth: found ${AUTH_PATH}`);
+  } catch {
+    return {
+      ok: false,
+      summary: "pi-codex-image unavailable: missing Codex auth file.",
+      details: [`expected auth at ${AUTH_PATH}`, "run `codex login`, then /reload in pi"],
+    };
+  }
+
+  let versionText = "unknown";
+  try {
+    const versionResult = await runCommandCapture("codex", ["--version"], { timeoutMs: PREFLIGHT_TIMEOUT_MS });
+    versionText = firstString(versionResult.stdout, versionResult.stderr) ?? "unknown";
+    details.push(`codex: ${versionText}`);
+  } catch (error) {
+    return {
+      ok: false,
+      summary: "pi-codex-image unavailable: `codex` CLI not found on PATH.",
+      details: [error instanceof Error ? error.message : String(error), "install Codex CLI, then /reload in pi"],
+    };
+  }
+
+  const helpResult = await runCommandCapture("codex", ["exec", "--help"], { timeoutMs: PREFLIGHT_TIMEOUT_MS }).catch(
+    (error) => {
+      throw new Error(error instanceof Error ? error.message : String(error));
+    },
+  );
+  const helpText = `${helpResult.stdout}\n${helpResult.stderr}`;
+  const missingFlags = ["--image", "--output-last-message"].filter((flag) => !helpText.includes(flag));
+  if (missingFlags.length > 0) {
+    return {
+      ok: false,
+      summary: "pi-codex-image unavailable: Codex CLI is missing required exec flags.",
+      details: [`missing flags: ${missingFlags.join(", ")}`, `detected version: ${versionText}`],
+    };
+  }
+
+  details.push("exec flags: --image and --output-last-message present");
+  return {
+    ok: true,
+    summary: `pi-codex-image ready (${versionText}).`,
+    details,
+  };
+}
+
+function mentionsPiCodexImage(text: string): boolean {
+  if (/\bpi[- ]codex[- ]image\b/i.test(text)) return true;
+  if (/\bcodex_image\b/i.test(text)) return false;
+
+  const mentionsCodex = /\b(use|ask)\s+codex\b/i.test(text) || /\bcodex image\b/i.test(text);
+  const mentionsImageTask = /\b(image|diagram|logo|poster|illustration|png|icon|banner|mockup|edit)\b/i.test(text);
+  return mentionsCodex && mentionsImageTask;
+}
+
+function aliasNote(toolReady: boolean, summary: string): string {
+  if (toolReady) {
+    return "[Extension note: the requested `pi-codex-image` capability is exposed as the `codex_image` tool. Prefer that tool for raster image generation or editing.]";
+  }
+  return `[Extension note: pi-codex-image is unavailable in this session (${summary}). Use /codex-image-doctor for details.]`;
+}
+
+export default async function codexImage(pi: ExtensionAPI) {
+  const startupHealth = await detectCodexHealth();
+  const toolReady = startupHealth.ok;
+
+  pi.on("input", async (event) => {
+    if (event.source === "extension") return { action: "continue" };
+    if (!mentionsPiCodexImage(event.text)) return { action: "continue" };
+    if (event.text.includes("[Extension note:")) return { action: "continue" };
+    return {
+      action: "transform",
+      text: `${event.text}\n\n${aliasNote(toolReady, startupHealth.summary)}`,
+      images: event.images,
+    };
+  });
+
+  pi.registerCommand("codex-image-doctor", {
+    description: "Check whether pi-codex-image is ready to register and run.",
+    handler: async (_args, ctx) => {
+      const health = await detectCodexHealth();
+      ctx.ui.notify(health.summary, health.ok ? "success" : "warning");
+      await ctx.ui.select("pi-codex-image doctor", [health.summary, ...health.details, "Press Esc to close"]);
+    },
+  });
+
+  if (!toolReady) {
+    return;
+  }
+
   pi.registerTool({
     name: TOOL_NAME,
-    label: "Codex image",
+    label: TOOL_LABEL,
     description:
-      "Generate or edit raster images via the local Codex CLI using Codex's built-in image_generation tool. Requires `codex` to be installed and logged in with ChatGPT.",
+      "Generate or edit raster images via the local Codex CLI using Codex's built-in image_generation tool. This is the tool behind requests like `use pi-codex-image`, `ask Codex to generate an image`, or `use Codex for this diagram`. Requires `codex` to be installed and logged in with ChatGPT.",
     promptSnippet:
-      "Generate or edit a bitmap image via the local Codex CLI and its built-in image_generation tool; supports optional local reference images and an optional output copy path.",
+      "Use `codex_image` (aka `pi-codex-image`) to generate or edit raster images through the local Codex CLI; supports local references and optional outputPath copying.",
     promptGuidelines: [
-      "Use this tool when the user wants a raster image and specifically wants Codex's image-generation capability.",
-      "Pass inputImages when the user provides local references or wants an existing local image edited.",
-      "If outputPath is set, this tool copies the generated image there after Codex finishes. Otherwise it returns the image inline only.",
+      "If the user explicitly says `pi-codex-image`, `use Codex`, or asks Codex to generate/edit an image, prefer this tool.",
+      "Pass inputImages when the user provides local reference images or wants an existing image edited.",
+      "If outputPath is set, request exactly one final image so the tool can copy it to disk cleanly.",
     ],
     parameters: TOOL_PARAMS,
+    prepareArguments: prepareToolArguments,
     async execute(_toolCallId, params: ToolParams, signal, onUpdate, ctx) {
       await ensureFileExists(AUTH_PATH, "Codex auth file (~/.codex/auth.json)");
 
@@ -238,9 +492,7 @@ export default function codexImage(pi: ExtensionAPI) {
         }),
       );
 
-      const resolvedOutputPath = params.outputPath
-        ? resolveUserPath(params.outputPath, ctx.cwd)
-        : undefined;
+      const resolvedOutputPath = params.outputPath ? resolveUserPath(params.outputPath, ctx.cwd) : undefined;
 
       if (resolvedOutputPath && params.outputPath && (params.outputPath.endsWith("/") || params.outputPath.endsWith("\\"))) {
         throw new Error("outputPath must be a file path, not a directory path.");
@@ -280,13 +532,13 @@ export default function codexImage(pi: ExtensionAPI) {
           args.push("--image", imagePath);
         }
 
-        args.push(prompt);
+        args.push("-");
 
         onUpdate?.({
           content: [
             {
               type: "text",
-              text: `Launching Codex image run${params.model ? ` with model ${params.model}` : ""}${resolvedInputImages.length > 0 ? ` using ${resolvedInputImages.length} input image${resolvedInputImages.length === 1 ? "" : "s"}` : ""}...`,
+              text: `Launching ${TOOL_LABEL}${params.model ? ` with model ${params.model}` : ""}${resolvedInputImages.length > 0 ? ` using ${resolvedInputImages.length} input image${resolvedInputImages.length === 1 ? "" : "s"}` : ""}...`,
             },
           ],
           details: {
@@ -296,13 +548,14 @@ export default function codexImage(pi: ExtensionAPI) {
           },
         });
 
-        const result = await runCodex(args, {
+        const result = await runCommandCapture("codex", args, {
           cwd: ctx.cwd,
           env: {
             ...process.env,
             CODEX_HOME: codexHome,
           },
           timeoutMs: timeoutSec * 1000,
+          stdinText: prompt,
           signal,
           onStatus: (text) => {
             onUpdate?.({
@@ -319,22 +572,11 @@ export default function codexImage(pi: ExtensionAPI) {
           .sort();
 
         if (result.timedOut) {
-          throw new Error(`Codex timed out after ${timeoutSec}s.`);
+          throw new Error(formatCodexFailure(result, finalMessage, timeoutSec));
         }
 
         if ((result.code ?? 1) !== 0) {
-          const stderrTail = tail(result.stderr);
-          const stdoutTail = tail(result.stdout);
-          throw new Error(
-            [
-              `Codex exited with code ${result.code ?? "unknown"}.`,
-              stderrTail ? `stderr:\n${stderrTail}` : "",
-              stdoutTail ? `stdout:\n${stdoutTail}` : "",
-              finalMessage.trim() ? `last message:\n${finalMessage.trim()}` : "",
-            ]
-              .filter(Boolean)
-              .join("\n\n"),
-          );
+          throw new Error(formatCodexFailure(result, finalMessage, timeoutSec));
         }
 
         if (generatedFiles.length === 0) {
@@ -343,6 +585,7 @@ export default function codexImage(pi: ExtensionAPI) {
               "Codex finished but no generated image was found.",
               finalMessage.trim() ? `last message:\n${finalMessage.trim()}` : "",
               result.stderr.trim() ? `stderr:\n${tail(result.stderr)}` : "",
+              "Hint: verify that your Codex build supports image_generation and emitted an artifact.",
             ]
               .filter(Boolean)
               .join("\n\n"),
@@ -351,7 +594,7 @@ export default function codexImage(pi: ExtensionAPI) {
 
         if (resolvedOutputPath && generatedFiles.length !== 1) {
           throw new Error(
-            `outputPath requires exactly one generated image, but Codex produced ${generatedFiles.length}.`,
+            `outputPath requires exactly one generated image, but Codex produced ${generatedFiles.length}. Try a prompt that explicitly asks for a single final image.`,
           );
         }
 
@@ -361,9 +604,7 @@ export default function codexImage(pi: ExtensionAPI) {
           if (!overwrite) {
             try {
               await access(resolvedOutputPath);
-              throw new Error(
-                `outputPath already exists: ${resolvedOutputPath}. Pass overwrite=true to replace it.`,
-              );
+              throw new Error(`outputPath already exists: ${resolvedOutputPath}. Pass overwrite=true to replace it.`);
             } catch (error) {
               if (!(error instanceof Error) || !error.message.startsWith("outputPath already exists:")) {
                 // File does not exist, which is what we want.
