@@ -2,8 +2,8 @@ import { spawn } from "node:child_process";
 import { access, copyFile, mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { truncateTail, withFileMutationQueue } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { truncateTail, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
 
 const TOOL_NAME = "codex_image";
