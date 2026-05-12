@@ -734,6 +734,7 @@ export default async function codexImage(pi: ExtensionAPI) {
       "If the user explicitly says `pi-codex-image`, `use Codex`, or asks Codex to generate/edit an image, prefer this tool.",
       "Pass inputImages when the user provides local reference images or wants an existing image edited.",
       "If outputPath is set, request exactly one final image so the tool can copy it to disk cleanly.",
+      "Very large reference images are currently sent as-is rather than downscaled; if an input-image request fails or is slow, retry with references resized to <=2048px on the longest side.",
     ],
     parameters: TOOL_PARAMS,
     prepareArguments: prepareToolArguments,

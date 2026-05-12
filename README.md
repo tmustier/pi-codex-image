@@ -126,7 +126,7 @@ Checks whether the extension is ready to call Codex directly, including:
 - `outputPath` only works when Codex produces exactly one image.
 - The extension asks Codex for a single final image by default unless the user explicitly requests variants.
 - Generated image output is always requested as PNG, matching Codex's own hosted tool setup.
-- Reference images are passed as data URLs; unlike Codex's Rust helper, this extension does not currently downscale very large local images before upload.
+- Reference images are passed as data URLs; unlike Codex's Rust helper, this extension does not currently downscale very large local images before upload. If a reference-image call is slow or fails, retry with inputs resized to <=2048px on the longest side.
 
 ## License
 
