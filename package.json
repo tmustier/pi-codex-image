@@ -1,7 +1,8 @@
 {
   "name": "pi-codex-image",
-  "version": "0.2.1",
-  "description": "Pi extension that exposes Codex CLI image generation as a smoother codex_image tool.",
+  "version": "0.3.0",
+  "description": "Pi extension that exposes Codex native image generation as a smoother codex_image tool.",
+  "type": "module",
   "license": "MIT",
   "private": false,
   "keywords": [
@@ -27,9 +28,11 @@
   "publishConfig": {
     "access": "public"
   },
+  "dependencies": {
+    "typebox": "^1.1.24"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
     "extensions": [

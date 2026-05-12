@@ -1,40 +1,50 @@
 # pi-codex-image
 
-Pi extension that exposes the local Codex CLI's built-in image generation capability as a Pi tool named `codex_image`.
+Pi extension that exposes Codex's native hosted `image_generation` capability as a Pi tool named `codex_image`.
+
+## What changed in 0.3
+
+Earlier versions shelled out to `codex exec` and asked the CLI to use its built-in `image_generation` tool. This version calls the Codex Responses endpoint directly:
+
+```text
+POST https://chatgpt.com/backend-api/codex/responses
+```
+
+with a hosted tool spec matching Codex source:
+
+```json
+{ "type": "image_generation", "output_format": "png" }
+```
+
+This avoids subprocesses, temporary `CODEX_HOME` directories, CLI prompt drift, and artifact scraping. Pi receives the generated image directly from the `image_generation_call.result` base64 payload.
 
 ## Why this version is smoother for agents
 
-This package is designed to reduce the two biggest failure modes we hit in practice:
-
-1. **execution drift** — the extension now sends the prompt to `codex exec` over stdin, which matches the current Codex CLI behavior
-2. **discoverability drift** — the extension explicitly bridges user phrasing like `pi-codex-image`, `use Codex`, or `ask Codex to generate an image` to the canonical Pi tool name `codex_image`
-
-It also adds:
-
-- startup preflight checks
-- argument normalization (`input_images`, `output_path`, `references`, etc.)
-- a `/codex-image-doctor` command
-- stronger single-image behavior when `outputPath` is set
+- **Native transport** — direct `/codex/responses` call instead of spawning the Codex CLI.
+- **Codex-compatible request shape** — ChatGPT auth headers, `OpenAI-Beta: responses=experimental`, hosted `image_generation` tool, SSE parsing, and PNG output format.
+- **Reference image support** — local images are attached as `input_image` data URLs, wrapped with Codex-style `<image name=[Image #N]>...</image>` labels.
+- **Discoverability bridge** — user phrasing like `pi-codex-image`, `use Codex`, or `ask Codex to generate an image` maps to the canonical Pi tool name `codex_image`.
+- **Output-path handling** — Pi can copy the single generated image to an exact requested path.
 
 ## What it does
 
 When Pi calls `codex_image`, the extension:
 
-1. checks that Codex is installed and logged in
-2. creates a temporary `CODEX_HOME`
-3. copies your Codex auth into that temp home
-4. runs `codex exec` non-interactively with `image_generation` enabled
-5. collects generated image file(s)
-6. returns the image(s) back to Pi
-7. optionally copies the single output image to a requested path
-
-This extension does **not** call an image API directly. It is a thin bridge from Pi to the local `codex` CLI.
+1. checks that Codex ChatGPT auth is available at `~/.codex/auth.json`
+2. refreshes the access token if it is already expired and a refresh token is present
+3. converts optional local reference images into Responses `input_image` data URLs
+4. calls `/codex/responses` with the hosted `image_generation` tool enabled
+5. parses SSE `image_generation_call` output items
+6. decodes the base64 PNG result(s)
+7. returns the image(s) back to Pi
+8. optionally writes the single output image to `outputPath`
 
 ## Requirements
 
 - Pi
-- local `codex` CLI installed and on `PATH`
 - Codex logged in with ChatGPT (`~/.codex/auth.json` present)
+
+The local `codex` CLI does not need to be invoked at runtime, though `codex login` is still the easiest way to create/refresh auth.
 
 ## Install
 
@@ -79,7 +89,7 @@ Parameters:
 - `inputImages` — optional array of local image paths
 - `outputPath` — optional exact file path for the final image
 - `overwrite` — optional boolean for replacing `outputPath`
-- `model` — optional Codex model override
+- `model` — optional Codex model override; defaults to `gpt-5.5` or `PI_CODEX_IMAGE_MODEL`
 - `timeoutSec` — optional timeout, default `180`
 
 The tool also normalizes common argument variants such as:
@@ -91,21 +101,32 @@ The tool also normalizes common argument variants such as:
 - `instructions`
 - `timeout`
 
+## Configuration
+
+Environment variables:
+
+- `PI_CODEX_IMAGE_MODEL` — default model override, default `gpt-5.5`
+- `PI_CODEX_IMAGE_BASE_URL` — Codex backend base URL or full `/codex/responses` URL, default `https://chatgpt.com/backend-api`
+- `CODEX_REFRESH_TOKEN_URL_OVERRIDE` — optional Codex OAuth refresh endpoint override, matching Codex CLI behavior
+
 ## Command
 
 ### `/codex-image-doctor`
 
-Checks whether the extension is ready to register and run, including:
+Checks whether the extension is ready to call Codex directly, including:
 
-- `codex` availability on `PATH`
 - auth file presence
-- required `codex exec` flags
+- ChatGPT account id presence
+- resolved endpoint
+- default model
+- whether the access token appears expired
 
 ## Notes
 
-- `outputPath` only works when Codex produces exactly one image
-- the extension asks Codex for a single final image by default unless the user explicitly requests variants
-- the extension runs Codex with a temporary `CODEX_HOME` and removes it afterward
+- `outputPath` only works when Codex produces exactly one image.
+- The extension asks Codex for a single final image by default unless the user explicitly requests variants.
+- Generated image output is always requested as PNG, matching Codex's own hosted tool setup.
+- Reference images are passed as data URLs; unlike Codex's Rust helper, this extension does not currently downscale very large local images before upload.
 
 ## License
 
